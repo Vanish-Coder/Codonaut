@@ -4,7 +4,7 @@ import sys
 import re
 import random
 
-# ── Grid constants (fixed logical size) ───────────────────────────────────────
+# ── Grid constants ─────────────────────────────────────────────────────────────
 COLS, ROWS  = 16, 10
 GROUND_ROW  = ROWS - 2
 PANEL_MIN_W = 280
@@ -12,9 +12,13 @@ PANEL_MAX_W = 420
 MIN_WIN_W   = 700
 MIN_WIN_H   = 480
 FPS         = 60
-STEP_MS     = 220
 
-# ── Colors ────────────────────────────────────────────────────────────────────
+# Animation speed range (ms per frame)
+STEP_MS_MIN = 80    # fastest  (~12 steps/s)
+STEP_MS_MAX = 600   # slowest  (~1.7 steps/s)
+STEP_MS_DEF = 220   # default (slider middle-ish)
+
+# ── Colours ────────────────────────────────────────────────────────────────────
 BG           = (8,  12,  26)
 GRID_LINE    = (40, 70, 160, 40)
 PLAT_TOP     = (42, 74, 170)
@@ -33,12 +37,26 @@ BOT_BODY     = (192, 216, 255)
 BOT_SUIT     = (26,  42,  94)
 BOT_VISOR    = (68, 170, 255)
 BOT_TRIM     = (138, 180, 255)
+SLIDER_TRACK = (30, 45, 90)
+SLIDER_FILL  = (74, 170, 255)
+SLIDER_THUMB = (180, 210, 255)
 
 random.seed(42)
 STAR_DATA = [(random.random(), random.random(), random.uniform(0.4, 1.8)) for _ in range(70)]
 
 
 # ── Parser ─────────────────────────────────────────────────────────────────────
+# camelCase call syntax → internal token
+ALIASES = {
+    'moveRight()': 'move_right',
+    'moveLeft()':  'move_left',
+    'jump()':      'jump',
+    'dash()':      'dash',
+    'shrink()':    'shrink',
+    'wait()':      'wait',
+    'flip()':      'flip',
+}
+
 def parse(source: str):
     lines = source.split('\n')
     cmds, i = [], 0
@@ -48,7 +66,8 @@ def parse(source: str):
         if not stripped:
             i += 1
             continue
-        m = re.fullmatch(r'repeat\s+(\d+)', stripped)
+        # repeat(N) with indented body
+        m = re.fullmatch(r'repeat\s*\(\s*(\d+)\s*\)', stripped)
         if m:
             n, body = int(m.group(1)), []
             i += 1
@@ -60,35 +79,71 @@ def parse(source: str):
                 else:
                     break
             if not body:
-                raise ValueError(f"'repeat {n}' has no indented body")
+                raise ValueError(f"repeat({n}) has no indented body")
             for _ in range(n):
                 cmds.extend(body)
-        else:
-            cmds.append(stripped)
-            i += 1
+            continue
+        if stripped not in ALIASES:
+            raise ValueError(f"Unknown command: '{stripped}'")
+        cmds.append(ALIASES[stripped])
+        i += 1
     return cmds
 
 
 # ── Interpreter ────────────────────────────────────────────────────────────────
-VALID = {'move right', 'move left', 'jump', 'dash', 'crouch', 'wait', 'flip'}
+VALID = set(ALIASES.values())
 
 def execute(cmds):
+    """
+    jump(): up → fwd × 2 → land
+    dash():  up → fwd × 3 → land
+    shrink(): toggles shrinked state (visual only, no grid position change)
+    """
     x, y, d = 1, GROUND_ROW - 1, 1
-    frames = [(x, y, d)]
+    shrinking = False
+    frames = [(x, y, d, shrinking)]
+
     for cmd in cmds:
         if cmd not in VALID:
             raise ValueError(f"Unknown command: '{cmd}'")
-        if   cmd == 'move right': x = min(x + 1, COLS - 1)
-        elif cmd == 'move left':  x = max(x - 1, 0)
+
+        if cmd == 'move_right':
+            x = min(x + 1, COLS - 1)
+
+        elif cmd == 'move_left':
+            x = max(x - 1, 0)
+
         elif cmd == 'jump':
-            frames.append((x, max(y - 1, 0), d))
+            air_y = max(y - 1, 0)
+            frames.append((x, air_y, d, False))          # up (never shrinked mid-air)
             x = min(max(x + d, 0), COLS - 1)
-            y = min(y, GROUND_ROW - 1)
-        elif cmd == 'dash':   x = min(max(x + d * 2, 0), COLS - 1)
-        elif cmd == 'crouch': y = min(y + 1, GROUND_ROW - 1)
-        elif cmd == 'wait':   pass
-        elif cmd == 'flip':   d = -d
-        frames.append((x, y, d))
+            frames.append((x, air_y, d, False))          # forward 1
+            x = min(max(x + d, 0), COLS - 1)
+            frames.append((x, air_y, d, False))          # forward 2
+            y = min(y, GROUND_ROW - 1)                   # land
+
+        elif cmd == 'dash':
+            air_y = max(y - 1, 0)
+            frames.append((x, air_y, d, False))          # up
+            x = min(max(x + d, 0), COLS - 1)
+            frames.append((x, air_y, d, False))          # forward 1
+            x = min(max(x + d, 0), COLS - 1)
+            frames.append((x, air_y, d, False))          # forward 2
+            x = min(max(x + d, 0), COLS - 1)
+            frames.append((x, air_y, d, False))          # forward 3
+            y = min(y, GROUND_ROW - 1)                   # land
+
+        elif cmd == 'shrink':
+            shrinking = not shrinking                     # toggle
+
+        elif cmd == 'wait':
+            pass
+
+        elif cmd == 'flip':
+            d = -d
+
+        frames.append((x, y, d, shrinking))
+
     return frames
 
 
@@ -115,10 +170,14 @@ def draw_ground(surf, cell):
         sh.fill(PLAT_SHINE)
         surf.blit(sh, (px+1, py+1))
 
-def draw_bot(surf, gx, gy, d, cell):
+def draw_bot(surf, gx, gy, d, cell, shrinking=False):
     cx = gx * cell + cell // 2
     cy = gy * cell + cell // 2
-    sc = cell / 48
+    if shrinking:
+        cy += cell // 2        # shift down half a tile visually
+        sc = cell / 48 * 0.55 # squish to 55% height
+    else:
+        sc = cell / 48
     tmp = pygame.Surface((cell, cell), pygame.SRCALPHA)
     hx, hy = cell // 2, cell // 2
     def s(v): return max(1, int(v * sc))
@@ -138,11 +197,89 @@ def draw_bot(surf, gx, gy, d, cell):
     surf.blit(tmp, (cx - cell // 2, cy - cell // 2))
 
 
+# ── Speed slider ───────────────────────────────────────────────────────────────
+class Slider:
+    """
+    Horizontal slider.  value is 0.0 (left/slow) → 1.0 (right/fast).
+    Converts to STEP_MS via inverse linear mapping.
+    """
+    TRACK_H  = 4
+    THUMB_R  = 7
+
+    def __init__(self):
+        self.rect  = pygame.Rect(0, 0, 0, 20)   # set by layout each frame
+        self.value = self._ms_to_val(STEP_MS_DEF)
+        self._drag = False
+
+    # ── value ↔ step_ms conversions ───────────────────────────────────────────
+    @staticmethod
+    def _ms_to_val(ms):
+        # value=0 → slow (STEP_MS_MAX), value=1 → fast (STEP_MS_MIN)
+        return (STEP_MS_MAX - ms) / (STEP_MS_MAX - STEP_MS_MIN)
+
+    @property
+    def step_ms(self):
+        return int(STEP_MS_MAX - self.value * (STEP_MS_MAX - STEP_MS_MIN))
+
+    # ── event handling ────────────────────────────────────────────────────────
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.rect.inflate(0, 14).collidepoint(event.pos):
+                self._drag = True
+                self._update_from_mouse(event.pos[0])
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._drag = False
+        elif event.type == pygame.MOUSEMOTION and self._drag:
+            self._update_from_mouse(event.pos[0])
+
+    def _update_from_mouse(self, mx):
+        t = (mx - self.rect.x) / max(self.rect.w, 1)
+        self.value = max(0.0, min(1.0, t))
+
+    # ── drawing ───────────────────────────────────────────────────────────────
+    def draw(self, surf, small_font, px, label_y, pw):
+        # draw "slow ──[●]── fast" label row above the track
+        slow_s = small_font.render('slow', True, TEXT_DIM)
+        fast_s = small_font.render('fast', True, TEXT_DIM)
+        slow_w = slow_s.get_width()
+        fast_w = fast_s.get_width()
+
+        # track sits between the two labels
+        track_pad = 6
+        track_x = px + slow_w + track_pad
+        track_w = pw - slow_w - fast_w - track_pad * 2
+        track_y = self.rect.y + self.rect.h // 2
+
+        # update stored rect for hit-testing
+        self.rect.x = track_x
+        self.rect.w = track_w
+
+        # labels
+        surf.blit(slow_s, (px, track_y - slow_s.get_height() // 2))
+        surf.blit(fast_s, (px + pw - fast_w, track_y - fast_s.get_height() // 2))
+
+        # track background
+        tr = pygame.Rect(track_x, track_y - self.TRACK_H // 2, track_w, self.TRACK_H)
+        pygame.draw.rect(surf, SLIDER_TRACK, tr, border_radius=2)
+
+        # filled portion
+        fill_w = int(track_w * self.value)
+        if fill_w > 0:
+            fr = pygame.Rect(track_x, track_y - self.TRACK_H // 2, fill_w, self.TRACK_H)
+            pygame.draw.rect(surf, SLIDER_FILL, fr, border_radius=2)
+
+        # thumb
+        tx = track_x + fill_w
+        pygame.draw.circle(surf, PANEL_BG,     (tx, track_y), self.THUMB_R + 1)
+        pygame.draw.circle(surf, SLIDER_THUMB, (tx, track_y), self.THUMB_R)
+        pygame.draw.circle(surf, SLIDER_FILL,  (tx, track_y), self.THUMB_R, 2)
+
+
 # ── Editor ─────────────────────────────────────────────────────────────────────
 class Editor:
     def __init__(self, font):
         self.font   = font
-        self.lines  = ['move right', 'move right', 'jump', 'move right', 'move right', '']
+        self.lines  = ['moveRight()', 'moveRight()', 'jump()', 'moveRight()', 'moveRight()', '']
         self.cur_l  = len(self.lines) - 1
         self.cur_c  = 0
         self.sel_l  = None
@@ -196,26 +333,22 @@ class Editor:
         shift = event.mod & pygame.KMOD_SHIFT
         k = event.key
 
-        # select-all
         if ctrl and k == pygame.K_a:
             self.sel_l, self.sel_c = 0, 0
             self.cur_l = len(self.lines) - 1
             self.cur_c = len(self.lines[self.cur_l])
             return
-        # copy
         if ctrl and k == pygame.K_c:
             txt = self._selected_text()
             if txt:
                 pygame.scrap.put(pygame.SCRAP_TEXT, txt.encode())
             return
-        # cut
         if ctrl and k == pygame.K_x:
             txt = self._selected_text()
             if txt:
                 pygame.scrap.put(pygame.SCRAP_TEXT, txt.encode())
                 self._delete_selection()
             return
-        # paste
         if ctrl and k == pygame.K_v:
             raw = pygame.scrap.get(pygame.SCRAP_TEXT)
             if raw:
@@ -239,7 +372,6 @@ class Editor:
                 self.sel_l = self.sel_c = None
             return
 
-        # navigation
         if k == pygame.K_UP:
             self._set_cursor(self.cur_l - 1, self.cur_c, shift); return
         if k == pygame.K_DOWN:
@@ -269,7 +401,6 @@ class Editor:
         if k == pygame.K_END:
             self._set_cursor(self.cur_l, len(self.lines[self.cur_l]), shift); return
 
-        # editing
         if k == pygame.K_RETURN:
             if self.sel_l is not None: self._delete_selection()
             rest = self.lines[self.cur_l][self.cur_c:]
@@ -386,14 +517,14 @@ class Button:
 
 # ── CMD reference ──────────────────────────────────────────────────────────────
 CMD_REF = [
-    ('move right', 'step right'),
-    ('move left',  'step left'),
-    ('jump',       'arc up + forward'),
-    ('dash',       'leap 2 forward'),
-    ('crouch',     'duck down'),
-    ('wait',       'skip a step'),
-    ('flip',       'reverse direction'),
-    ('repeat N',   'loop N times'),
+    ('moveRight()', 'step right'),
+    ('moveLeft()',  'step left'),
+    ('jump()',      'up → fwd×2 → down'),
+    ('dash()',      'up → fwd×3 → down'),
+    ('shrink()',    'toggle shrink'),
+    ('wait()',      'skip a step'),
+    ('flip()',      'reverse direction'),
+    ('repeat(N)',   'loop N times'),
 ]
 
 
@@ -417,23 +548,24 @@ def main():
     editor    = Editor(mono)
     run_btn   = Button('▶  run',   mono,  (22, 40, 100), (34, 58, 140))
     reset_btn = Button('↺  reset', small, (16, 24,  60), (24, 36,  90))
+    slider    = Slider()
 
-    frames       = [(1, GROUND_ROW - 1, 1)]
+    frames       = [(1, GROUND_ROW - 1, 1, False)]
     anim_idx     = 0
-    anim_accum   = 0
+    anim_accum   = 0.0
     running_anim = False
     status_msg   = ''
     status_col   = TEXT_DIM
     tick         = 0
     editor_focused = True
-    editor_rect    = pygame.Rect(0, 0, 0, 0)  # updated each frame
+    editor_rect    = pygame.Rect(0, 0, 0, 0)
 
     def do_run():
         nonlocal frames, anim_idx, anim_accum, running_anim, status_msg, status_col
         try:
             cmds   = parse(editor.get_source())
             frames = execute(cmds)
-            anim_idx = anim_accum = 0
+            anim_idx = 0; anim_accum = 0.0
             running_anim = True
             n = len(cmds)
             status_msg = f'{n} command{"s" if n != 1 else ""} — running...'
@@ -445,11 +577,9 @@ def main():
 
     def do_reset():
         nonlocal frames, anim_idx, running_anim, status_msg, status_col
-        frames = [(1, GROUND_ROW - 1, 1)]
-        anim_idx = 0
-        running_anim = False
-        status_msg = 'reset'
-        status_col = TEXT_DIM
+        frames = [(1, GROUND_ROW - 1, 1, False)]
+        anim_idx = 0; running_anim = False
+        status_msg = 'reset'; status_col = TEXT_DIM
         editor.lines = ['']
         editor.cur_l = editor.cur_c = 0
         editor.sel_l = editor.sel_c = None
@@ -461,6 +591,9 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
+
+            # slider gets first crack at mouse events
+            slider.handle_event(event)
 
             if event.type == pygame.MOUSEBUTTONDOWN:
                 editor_focused = editor_rect.collidepoint(event.pos)
@@ -474,11 +607,12 @@ def main():
             if run_btn.clicked(event):   do_run()
             if reset_btn.clicked(event): do_reset()
 
-        # advance animation
+        # ── advance animation using live slider value ──────────────────────────
+        step_ms = slider.step_ms
         if running_anim:
             anim_accum += dt
-            while anim_accum >= STEP_MS:
-                anim_accum -= STEP_MS
+            while anim_accum >= step_ms:
+                anim_accum -= step_ms
                 anim_idx   += 1
                 if anim_idx >= len(frames):
                     anim_idx     = len(frames) - 1
@@ -488,49 +622,47 @@ def main():
                     break
 
         # ── layout ────────────────────────────────────────────────────────────
-        ww, wh  = screen.get_size()
-        ww      = max(ww, MIN_WIN_W)
-        wh      = max(wh, MIN_WIN_H)
+        ww, wh = screen.get_size()
+        ww = max(ww, MIN_WIN_W);  wh = max(wh, MIN_WIN_H)
 
         panel_w = max(PANEL_MIN_W, min(PANEL_MAX_W, int(ww * 0.28)))
         grid_w  = ww - panel_w
         grid_h  = wh
         cell    = min(grid_w // COLS, grid_h // ROWS)
-        draw_gw = COLS * cell
-        draw_gh = ROWS * cell
+        draw_gw = COLS * cell;  draw_gh = ROWS * cell
         grid_ox = (grid_w - draw_gw) // 2
         grid_oy = (grid_h - draw_gh) // 2
 
-        PAD      = 12
-        px       = grid_w + PAD
-        pw       = panel_w - PAD * 2
-        lh_m     = mono.get_linesize()
-        lh_s     = small.get_linesize()
+        PAD    = 12
+        px     = grid_w + PAD
+        pw     = panel_w - PAD * 2
+        lh_m   = mono.get_linesize()
+        lh_s   = small.get_linesize()
 
-        # Fixed-height panel items (from bottom up)
+        SLIDER_H = lh_s + 10   # row height for the slider widget
         HINT_H   = lh_s + PAD
-        # Command ref: header + rows
-        ref_rows = len(CMD_REF)
-        REF_H    = lh_s + 4 + ref_rows * (lh_s + 2)
-        # Status
+        REF_H    = lh_s + 4 + len(CMD_REF) * (lh_s + 2)
         STATUS_H = lh_s + 6
-        # Buttons
         BTN_H    = 32
         SBTN_H   = 26
         LABEL_H  = lh_m + 4
 
-        # editor stretches to fill remaining vertical space
-        fixed_below_editor = BTN_H + 6 + SBTN_H + 8 + STATUS_H + 10 + REF_H + HINT_H
+        fixed_below_editor = (SLIDER_H + 6 + BTN_H + 6 + SBTN_H + 8 +
+                               STATUS_H + 10 + REF_H + HINT_H)
         editor_h = max(60, wh - PAD - LABEL_H - 6 - fixed_below_editor - PAD)
 
-        # compute y positions top-down
         y = PAD
-        label_y    = y;                         y += LABEL_H + 4
-        editor_rect = pygame.Rect(px, y, pw, editor_h); y += editor_h + 6
-        run_btn.rect   = pygame.Rect(px, y, pw, BTN_H);  y += BTN_H + 6
-        reset_btn.rect = pygame.Rect(px, y, pw, SBTN_H); y += SBTN_H + 8
-        status_y   = y;                         y += STATUS_H + 10
-        ref_start  = y
+        label_y     = y;                                    y += LABEL_H + 4
+        editor_rect  = pygame.Rect(px, y, pw, editor_h);   y += editor_h + 6
+        slider_y     = y;                                   y += SLIDER_H + 6
+        run_btn.rect    = pygame.Rect(px, y, pw, BTN_H);   y += BTN_H + 6
+        reset_btn.rect  = pygame.Rect(px, y, pw, SBTN_H);  y += SBTN_H + 8
+        status_y     = y;                                   y += STATUS_H + 10
+        ref_start    = y
+
+        # position slider rect (y-centre of the track row)
+        slider.rect.y = slider_y + SLIDER_H // 2 - slider.THUMB_R
+        slider.rect.h = slider.THUMB_R * 2
 
         # ── draw grid ─────────────────────────────────────────────────────────
         grid_surf = pygame.Surface((grid_w, grid_h))
@@ -539,8 +671,8 @@ def main():
         sub.fill(BG)
         draw_grid(sub, draw_gw, draw_gh, cell)
         draw_ground(sub, cell)
-        fx, fy, fd = frames[anim_idx]
-        draw_bot(sub, fx, fy, fd, cell)
+        fx, fy, fd, fshrinking = frames[anim_idx]
+        draw_bot(sub, fx, fy, fd, cell, fshrinking)
         grid_surf.blit(sub, (grid_ox, grid_oy))
         screen.blit(grid_surf, (0, 0))
 
@@ -548,25 +680,22 @@ def main():
         pygame.draw.rect(screen, PANEL_BG, (grid_w, 0, panel_w, wh))
         pygame.draw.line(screen, PANEL_BORDER, (grid_w, 0), (grid_w, wh))
 
-        # label
         screen.blit(mono.render('your program', True, TEXT_DIM), (px, label_y))
-
-        # editor
         editor.draw(screen, editor_rect, editor_focused, tick)
 
-        # buttons
+        # speed slider
+        slider.draw(screen, small, px, slider_y, pw)
+
         run_btn.draw(screen)
         reset_btn.draw(screen)
 
-        # status (one line, never overflows)
         if status_msg:
             msg = status_msg
             while msg and small.size(msg)[0] > pw:
                 msg = msg[:-1]
             screen.blit(small.render(msg, True, status_col), (px, status_y))
 
-        # command reference (stop drawing rows that would overlap hint)
-        ry       = ref_start
+        ry = ref_start
         hint_top = wh - HINT_H
         screen.blit(small.render('commands', True, TEXT_DIM), (px, ry))
         ry += lh_s + 4
@@ -575,7 +704,6 @@ def main():
                 break
             cs = small.render(cmd, True, CURSOR_COL)
             screen.blit(cs, (px, ry))
-            # description: truncate to remaining width
             avail = pw - cs.get_width() - 6
             d_txt = '  ' + desc
             while d_txt and small.size(d_txt)[0] > avail:
@@ -583,7 +711,6 @@ def main():
             screen.blit(small.render(d_txt, True, TEXT_DIM), (px + cs.get_width(), ry))
             ry += lh_s + 2
 
-        # hint pinned to bottom
         screen.blit(small.render('ctrl+R = run', True, (40, 60, 100)), (px, wh - HINT_H))
 
         pygame.display.flip()
